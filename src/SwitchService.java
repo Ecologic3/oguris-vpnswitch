@@ -27,11 +27,14 @@ import android.os.Looper;
  *   com.tailscale.ipn.CONNECT_VPN    -> connect
  *   com.tailscale.ipn.DISCONNECT_VPN -> disconnect
  * The USE_EXIT_NODE broadcast is never used (clearing an exit node that way
- * is a documented crash-loop poison pill). A broadcast is sent only on a
- * state transition, and only after the new state has been stable for about
- * 30 seconds, so brief WiFi drops do not flap the VPN. A redacted SSID read
- * while WiFi stays connected is not a transition either: the current state
- * is held until a read produces positive evidence.
+ * is a documented crash-loop poison pill). The service is fully
+ * event-driven (since 1.5): there is no polling loop and no stability
+ * delay. Evaluations run on service start, on network callback events and
+ * on UI-triggered re-evaluation, and a broadcast is sent only on a state
+ * transition, immediately, in the evaluation that first produces the new
+ * state. A redacted SSID read while WiFi stays connected is not a
+ * transition either: the current state is held until a read produces
+ * positive evidence.
  *
  * Network truth comes from dedicated callbacks, not from the default
  * network: once a VPN is up the default network IS the VPN, so reads keyed
@@ -51,8 +54,6 @@ public class SwitchService extends Service {
     private static final String CHANNEL_ID = "vpnswitch_status_min";
     private static final String OLD_CHANNEL_ID = "vpnswitch";
     private static final int NOTIF_ID = 1;
-    private static final long DEBOUNCE_MS = 30000;
-    private static final long RECHECK_MS = 60000;
 
     private static final String TS_PACKAGE = "com.tailscale.ipn";
     private static final String TS_RECEIVER = "com.tailscale.ipn.IPNReceiver";
@@ -74,10 +75,6 @@ public class SwitchService extends Service {
     private volatile Network wifiNetwork;
     private volatile NetworkCapabilities wifiCaps;
     private volatile Network cellNetwork;
-    private String pendingState = "";
-    private long pendingSince = 0;
-    private Runnable pendingRunnable;
-    private Runnable recheckRunnable;
     private boolean ssidUnknownLogged = false;
     private String lastEvalSig = null;
 
@@ -113,7 +110,6 @@ public class SwitchService extends Service {
         createChannel();
         registerCallbacks();
         startForeground(NOTIF_ID, buildNotification(readNet()));
-        scheduleRecheck();
         evaluate();
     }
 
@@ -141,14 +137,6 @@ public class SwitchService extends Service {
                 } catch (Exception e) {
                     // already unregistered
                 }
-            }
-        }
-        if (handler != null) {
-            if (pendingRunnable != null) {
-                handler.removeCallbacks(pendingRunnable);
-            }
-            if (recheckRunnable != null) {
-                handler.removeCallbacks(recheckRunnable);
             }
         }
         super.onDestroy();
@@ -181,7 +169,7 @@ public class SwitchService extends Service {
                     .build();
             cm.registerNetworkCallback(wifiReq, wifiCallback);
         } catch (Exception e) {
-            // monitoring continues via the supplements and the recheck
+            // monitoring continues via the supplement reads in readNet()
         }
         try {
             NetworkRequest cellReq = new NetworkRequest.Builder()
@@ -189,7 +177,7 @@ public class SwitchService extends Service {
                     .build();
             cm.registerNetworkCallback(cellReq, cellCallback);
         } catch (Exception e) {
-            // the recheck's one-shot reads still detect mobile data
+            // the one-shot reads in readNet() still detect mobile data
         }
     }
 
@@ -254,17 +242,6 @@ public class SwitchService extends Service {
         }
     }
 
-    private void scheduleRecheck() {
-        recheckRunnable = new Runnable() {
-            @Override
-            public void run() {
-                evaluate();
-                handler.postDelayed(recheckRunnable, RECHECK_MS);
-            }
-        };
-        handler.postDelayed(recheckRunnable, RECHECK_MS);
-    }
-
     private static class NetInfo {
         boolean onWifi;
         boolean onCellular;
@@ -295,7 +272,8 @@ public class SwitchService extends Service {
 
     /**
      * The single network-reading path used by every evaluation (service
-     * start, network callbacks, the periodic recheck). The WiFi tracker's
+     * start, network callbacks, UI-triggered re-evaluation). The WiFi
+     * tracker's
      * latest WifiInfo is the primary SSID source; one-shot capabilities
      * reads and WifiManager.getConnectionInfo() only supplement it, and
      * any positively known SSID wins over redacted ones. "On WiFi" comes
@@ -445,12 +423,9 @@ public class SwitchService extends Service {
         if (ni.onWifi && ni.ssid == null) {
             // Connected to WiFi but every read came back redacted, so the
             // network name is unknown. That is not evidence of being Away:
-            // hold the current state, start no debounce, change nothing.
-            // Away requires positive evidence (WiFi gone, or a positively
-            // read SSID that is not a home network).
-            cancelPending();
-            pendingState = "";
-            pendingSince = 0;
+            // hold the current state and change nothing. Away requires
+            // positive evidence (WiFi gone, or a positively read SSID
+            // that is not a home network).
             if (!ssidUnknownLogged) {
                 ssidUnknownLogged = true;
                 prefs.addLog("SSID unknown, holding state (via " + ni.ssidSource + ")");
@@ -465,43 +440,16 @@ public class SwitchService extends Service {
         } else {
             raw = Prefs.STATE_AWAY;
         }
-        String commanded = prefs.getCommandedState();
-        if (raw.equals(commanded)) {
-            pendingState = "";
-            pendingSince = 0;
-            cancelPending();
-        } else {
-            long now = System.currentTimeMillis();
-            if (!raw.equals(pendingState)) {
-                pendingState = raw;
-                pendingSince = now;
-                schedulePending(DEBOUNCE_MS);
-            } else if (now - pendingSince >= DEBOUNCE_MS) {
-                fire(raw, ni);
-            } else {
-                schedulePending(DEBOUNCE_MS - (now - pendingSince));
-            }
+        // Fully event-driven: a definite new state fires its transition
+        // broadcast right here, in this evaluation. No stability delay,
+        // and transition-only, so repeated identical evaluations (the
+        // callbacks can burst several times per network change) never
+        // re-send the current state's command.
+        if (!raw.equals(prefs.getCommandedState())) {
+            fire(raw, ni);
         }
         updateNotification(ni);
         sendRefresh();
-    }
-
-    private void schedulePending(long delayMs) {
-        cancelPending();
-        pendingRunnable = new Runnable() {
-            @Override
-            public void run() {
-                evaluate();
-            }
-        };
-        handler.postDelayed(pendingRunnable, Math.max(delayMs, 1000));
-    }
-
-    private void cancelPending() {
-        if (pendingRunnable != null && handler != null) {
-            handler.removeCallbacks(pendingRunnable);
-            pendingRunnable = null;
-        }
     }
 
     private void fire(String state, NetInfo ni) {
@@ -524,8 +472,6 @@ public class SwitchService extends Service {
         prefs.addLog((home ? "HOME" : "AWAY") + " on " + where(ni)
                 + " (via " + ni.ssidSource + ") -> "
                 + (home ? "DISCONNECT" : "CONNECT"));
-        pendingState = "";
-        pendingSince = 0;
     }
 
     private void createChannel() {

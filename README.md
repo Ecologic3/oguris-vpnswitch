@@ -5,8 +5,10 @@ home networks and on everywhere else.
 
 - Switching: explicit broadcasts to `com.tailscale.ipn/.IPNReceiver`
   (`com.tailscale.ipn.CONNECT_VPN` / `com.tailscale.ipn.DISCONNECT_VPN`),
-  sent only on state transitions, after the new state has been stable
-  for ~30 s. The `USE_EXIT_NODE` broadcast is never used (clearing an
+  sent only on state transitions. The service is fully event-driven:
+  network callbacks trigger an evaluation and a definite new state
+  fires its broadcast in that same evaluation, with no polling loop
+  and no stability delay. The `USE_EXIT_NODE` broadcast is never used (clearing an
   exit node that way is a documented crash-loop poison pill). When
   Tailscale reconnects it restores the selected exit node by itself.
 - Monitoring runs in a foreground service (`specialUse` type, the same
@@ -23,10 +25,16 @@ home networks and on everywhere else.
   `oguris-vpnswitch.keystore` (alias `oguris-vpnswitch`), the same
   per-app keystore convention as the other Oguri apps; future updates
   of this app must keep using it.
-- Package `app.oguri.vpnswitch`, version 1.4 (versionCode 5),
+- Package `app.oguri.vpnswitch`, version 1.5 (versionCode 6),
   minSdk 29, targetSdk 34.
 - v1.4: the foreground-service status notification moved to a new
   IMPORTANCE_MIN channel (`vpnswitch_status_min`; the v1.0-v1.3 channel
   `vpnswitch` is deleted on service start) with a short state-only
   title, so it shows no status-bar icon and sits minimized at the
   bottom of the shade. Switching logic unchanged.
+- v1.5: fully event-driven timing. The 60 s periodic recheck and the
+  ~30 s stability debounce are gone; evaluations run only on service
+  start, on WiFi/cellular callback events and on UI-triggered
+  re-evaluation, and a definite new state fires its transition
+  broadcast in that same evaluation. The unreadable-SSID hold is
+  unchanged.

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds OguriVpnSwitch-v1.4.apk with the manual pipeline (no Gradle).
+# Builds OguriVpnSwitch-v1.5.apk with the manual pipeline (no Gradle).
 # Same pattern as the other Oguri apps (printer/chips): aapt2 link,
 # javac (no lambdas, they break d8), d8, dex zipped in from inside the
 # dex dir so classes.dex lands at the APK root, zipalign, apksigner.
@@ -18,7 +18,7 @@ if [ ! -f "$KS" ]; then
     -dname "CN=Oguri VPN Switch, O=Oguri, C=SK"
 fi
 
-OUT="OguriVpnSwitch-v1.4.apk"
+OUT="OguriVpnSwitch-v1.5.apk"
 rm -rf build
 mkdir -p build/classes build/dex
 
