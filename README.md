@@ -27,7 +27,7 @@ home networks and on everywhere else.
   `oguris-vpnswitch.keystore` (alias `oguris-vpnswitch`), the same
   per-app keystore convention as the other Oguri apps; future updates
   of this app must keep using it.
-- Package `app.oguri.vpnswitch`, version 1.8 (versionCode 9),
+- Package `app.oguri.vpnswitch`, version 1.9 (versionCode 10),
   minSdk 29, targetSdk 34.
 - v1.4: the foreground-service status notification moved to a new
   IMPORTANCE_MIN channel (`vpnswitch_status_min`; the v1.0-v1.3 channel
@@ -79,3 +79,21 @@ home networks and on everywhere else.
   fires, or the service stops. The 1.7 gate, the readNet()
   short-circuit, the hold semantics and the transition-only
   broadcasts are unchanged.
+- v1.9: MainActivity redesign, switching logic untouched. The
+  home-networks text editor and its save button are gone: saved
+  networks show as a list with a remove control per row, and an
+  "add current network" button adds the WiFi the phone is on
+  (disabled, with the reason on the button, when not on WiFi, when
+  the name is unreadable, or when it is already saved). Every edit
+  rewrites the same newline-joined Prefs list at once, and since
+  the service reads that list on every evaluation, edits apply
+  live. The monitoring toggle moved above the permission buttons,
+  the "hide the status notification" button is removed, and the
+  event log now starts hidden behind a Show log / Hide log toggle
+  at the bottom. The UI has its own "midnight indigo" theme (deep
+  blue-slate surfaces, pale text, a signal-cyan accent), drawn
+  programmatically like before, plus a matching launcher icon (a
+  toggle in the ON position) in the sibling apps' adaptive-icon
+  format: `res/mipmap-anydpi-v26/ic_launcher.xml` over
+  `@color/ic_bg`, per-density foreground and legacy PNGs, drawn by
+  `icon-src/generate_icon.py` (preview in `icon-preview-1.9.png`).
