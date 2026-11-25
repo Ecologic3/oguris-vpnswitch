@@ -11,6 +11,7 @@ import android.content.Intent;
 import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
 import android.os.Build;
@@ -31,6 +32,13 @@ import android.os.Looper;
  * 30 seconds, so brief WiFi drops do not flap the VPN. A redacted SSID read
  * while WiFi stays connected is not a transition either: the current state
  * is held until a read produces positive evidence.
+ *
+ * Network truth comes from dedicated callbacks, not from the default
+ * network: once a VPN is up the default network IS the VPN, so reads keyed
+ * off it lose the WiFi SSID. A callback registered with a TRANSPORT_WIFI
+ * request plus FLAG_INCLUDE_LOCATION_INFO tracks the WiFi network itself
+ * and delivers unredacted WifiInfo; a second TRANSPORT_CELLULAR callback
+ * provides the positive "on mobile data" evidence for Away.
  */
 public class SwitchService extends Service {
     public static final String ACTION_REEVALUATE = "app.oguri.vpnswitch.REEVALUATE";
@@ -46,38 +54,48 @@ public class SwitchService extends Service {
     private static final String TS_CONNECT = "com.tailscale.ipn.CONNECT_VPN";
     private static final String TS_DISCONNECT = "com.tailscale.ipn.DISCONNECT_VPN";
 
+    private static final String SRC_WIFI_CALLBACK = "wifi-callback";
+    private static final String SRC_ONESHOT = "oneshot";
+    private static final String SRC_WIFIMANAGER = "wifimanager";
+    private static final String SRC_NONE = "none";
+
     private Handler handler;
     private Prefs prefs;
     private ConnectivityManager cm;
-    private ConnectivityManager.NetworkCallback callback;
+    private ConnectivityManager.NetworkCallback wifiCallback;
+    private ConnectivityManager.NetworkCallback cellCallback;
+    // Written from the ConnectivityManager callback threads, read on the
+    // main thread in readNet(); volatile for visibility.
+    private volatile Network wifiNetwork;
+    private volatile NetworkCapabilities wifiCaps;
+    private volatile Network cellNetwork;
     private String pendingState = "";
     private long pendingSince = 0;
     private Runnable pendingRunnable;
     private Runnable recheckRunnable;
-    private NetworkCapabilities lastCaps;
-    private Network lastCapsNetwork;
-    private boolean unknownHold = false;
+    private boolean ssidUnknownLogged = false;
+    private String lastEvalSig = null;
 
-    public static void start(Context context) {
-        Intent intent = new Intent(context, SwitchService.class);
+    public static void start(Context ctx) {
+        Intent svc = new Intent(ctx, SwitchService.class);
         if (Build.VERSION.SDK_INT >= 26) {
-            context.startForegroundService(intent);
+            ctx.startForegroundService(svc);
         } else {
-            context.startService(intent);
+            ctx.startService(svc);
         }
     }
 
-    public static void stop(Context context) {
-        context.stopService(new Intent(context, SwitchService.class));
+    public static void stop(Context ctx) {
+        ctx.stopService(new Intent(ctx, SwitchService.class));
     }
 
-    public static void reevaluate(Context context) {
-        Intent intent = new Intent(context, SwitchService.class);
-        intent.setAction(ACTION_REEVALUATE);
+    public static void reevaluate(Context ctx) {
+        Intent svc = new Intent(ctx, SwitchService.class);
+        svc.setAction(ACTION_REEVALUATE);
         if (Build.VERSION.SDK_INT >= 26) {
-            context.startForegroundService(intent);
+            ctx.startForegroundService(svc);
         } else {
-            context.startService(intent);
+            ctx.startService(svc);
         }
     }
 
@@ -86,10 +104,10 @@ public class SwitchService extends Service {
         super.onCreate();
         prefs = new Prefs(this);
         handler = new Handler(Looper.getMainLooper());
-        cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+        cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
         createChannel();
+        registerCallbacks();
         startForeground(NOTIF_ID, buildNotification(readNet()));
-        registerCallback();
         scheduleRecheck();
         evaluate();
     }
@@ -104,11 +122,20 @@ public class SwitchService extends Service {
 
     @Override
     public void onDestroy() {
-        if (callback != null && cm != null) {
-            try {
-                cm.unregisterNetworkCallback(callback);
-            } catch (Exception e) {
-                // already unregistered
+        if (cm != null) {
+            if (wifiCallback != null) {
+                try {
+                    cm.unregisterNetworkCallback(wifiCallback);
+                } catch (Exception e) {
+                    // already unregistered
+                }
+            }
+            if (cellCallback != null) {
+                try {
+                    cm.unregisterNetworkCallback(cellCallback);
+                } catch (Exception e) {
+                    // already unregistered
+                }
             }
         }
         if (handler != null) {
@@ -127,53 +154,86 @@ public class SwitchService extends Service {
         return null;
     }
 
-    private void registerCallback() {
+    private void registerCallbacks() {
         if (cm == null) {
             return;
         }
         // On Android 12+ (API 31+) the callback must carry
-        // FLAG_INCLUDE_LOCATION_INFO, otherwise the WifiInfo delivered
-        // to onCapabilitiesChanged is location-redacted ("<unknown ssid>").
+        // FLAG_INCLUDE_LOCATION_INFO, otherwise the WifiInfo delivered to
+        // onCapabilitiesChanged is location-redacted ("<unknown ssid>").
         if (Build.VERSION.SDK_INT >= 31) {
-            callback = new NetCallback(ConnectivityManager.NetworkCallback.FLAG_INCLUDE_LOCATION_INFO);
+            wifiCallback = new WifiCallback(
+                    ConnectivityManager.NetworkCallback.FLAG_INCLUDE_LOCATION_INFO);
         } else {
-            // no location flag in the callback before Android 12
-            callback = new NetCallback();
+            wifiCallback = new WifiCallback();
+        }
+        cellCallback = new CellCallback();
+        try {
+            // No NET_CAPABILITY_INTERNET requirement: a home WiFi whose
+            // uplink is down is still home.
+            NetworkRequest wifiReq = new NetworkRequest.Builder()
+                    .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                    .build();
+            cm.registerNetworkCallback(wifiReq, wifiCallback);
+        } catch (Exception e) {
+            // monitoring continues via the supplements and the recheck
         }
         try {
-            cm.registerDefaultNetworkCallback(callback);
+            NetworkRequest cellReq = new NetworkRequest.Builder()
+                    .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
+                    .build();
+            cm.registerNetworkCallback(cellReq, cellCallback);
         } catch (Exception e) {
-            // monitoring continues via the one-shot reads and the recheck
+            // the recheck's one-shot reads still detect mobile data
         }
     }
 
-    private class NetCallback extends ConnectivityManager.NetworkCallback {
-        NetCallback() {
+    /** Tracks the WiFi network itself, independent of the default route. */
+    private class WifiCallback extends ConnectivityManager.NetworkCallback {
+        WifiCallback() {
             super();
         }
 
-        NetCallback(int flags) {
+        WifiCallback(int flags) {
             super(flags);
         }
 
         @Override
         public void onAvailable(Network network) {
-            postEvaluate();
-        }
-
-        @Override
-        public void onLost(Network network) {
-            if (network != null && network.equals(lastCapsNetwork)) {
-                lastCaps = null;
-                lastCapsNetwork = null;
-            }
+            wifiNetwork = network;
             postEvaluate();
         }
 
         @Override
         public void onCapabilitiesChanged(Network network, NetworkCapabilities caps) {
-            lastCapsNetwork = network;
-            lastCaps = caps;
+            wifiNetwork = network;
+            wifiCaps = caps;
+            postEvaluate();
+        }
+
+        @Override
+        public void onLost(Network network) {
+            if (network != null && network.equals(wifiNetwork)) {
+                wifiNetwork = null;
+                wifiCaps = null;
+            }
+            postEvaluate();
+        }
+    }
+
+    /** Tracks whether any cellular network is present (Away evidence). */
+    private class CellCallback extends ConnectivityManager.NetworkCallback {
+        @Override
+        public void onAvailable(Network network) {
+            cellNetwork = network;
+            postEvaluate();
+        }
+
+        @Override
+        public void onLost(Network network) {
+            if (network != null && network.equals(cellNetwork)) {
+                cellNetwork = null;
+            }
             postEvaluate();
         }
     }
@@ -202,11 +262,17 @@ public class SwitchService extends Service {
 
     private static class NetInfo {
         boolean onWifi;
-        String ssid;
+        boolean onCellular;
+        String ssid; // null when not on WiFi or the name is unknown
+        String ssidSource = SRC_NONE; // which read produced ssid
     }
 
     private static boolean capsHaveWifi(NetworkCapabilities caps) {
         return caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI);
+    }
+
+    private static boolean capsHaveCellular(NetworkCapabilities caps) {
+        return caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR);
     }
 
     private static String ssidFromCaps(NetworkCapabilities caps) {
@@ -214,9 +280,9 @@ public class SwitchService extends Service {
             return null;
         }
         if (Build.VERSION.SDK_INT >= 31) {
-            Object info = caps.getTransportInfo();
-            if (info instanceof WifiInfo) {
-                return cleanSsid(((WifiInfo) info).getSSID());
+            Object ti = caps.getTransportInfo();
+            if (ti instanceof WifiInfo) {
+                return cleanSsid(((WifiInfo) ti).getSSID());
             }
         }
         return null;
@@ -224,57 +290,101 @@ public class SwitchService extends Service {
 
     /**
      * The single network-reading path used by every evaluation (service
-     * start, network callbacks, the periodic recheck). The callback's
-     * latest capabilities are the primary SSID source; one-shot reads of
-     * the active network and WifiManager.getConnectionInfo() only
-     * supplement it, and any positively known SSID wins over redacted
-     * ones. The result has ssid == null while onWifi is true when every
-     * source came back redacted; callers must not treat that as evidence
-     * of being away from home.
+     * start, network callbacks, the periodic recheck). The WiFi tracker's
+     * latest WifiInfo is the primary SSID source; one-shot capabilities
+     * reads and WifiManager.getConnectionInfo() only supplement it, and
+     * any positively known SSID wins over redacted ones. "On WiFi" comes
+     * from the tracker, never from the default network (which is the VPN
+     * itself while Tailscale is up). The result has ssid == null while
+     * onWifi is true when every source came back redacted; callers must
+     * not treat that as evidence of being away from home.
      */
     private NetInfo readNet() {
         NetInfo ni = new NetInfo();
         ni.onWifi = false;
+        ni.onCellular = cellNetwork != null;
         ni.ssid = null;
+
+        // 1) WiFi tracker (primary).
+        Network tracked = wifiNetwork;
+        if (tracked != null) {
+            ni.onWifi = true;
+            String s = ssidFromCaps(wifiCaps);
+            if (s != null) {
+                ni.ssid = s;
+                ni.ssidSource = SRC_WIFI_CALLBACK;
+            }
+        }
+
+        // One-shot capabilities of the active (default) network, used for
+        // the cellular supplement and as a last-resort WiFi supplement.
         NetworkCapabilities activeCaps = null;
-        Network active = null;
-        try {
-            if (cm != null) {
-                active = cm.getActiveNetwork();
+        if (cm != null) {
+            try {
+                Network active = cm.getActiveNetwork();
                 if (active != null) {
                     activeCaps = cm.getNetworkCapabilities(active);
                 }
+            } catch (Exception e) {
+                // fall through to the other candidates
             }
-        } catch (Exception e) {
-            // fall through to the other candidates
         }
-        NetworkCapabilities cbCaps = null;
-        if (lastCaps != null && active != null && active.equals(lastCapsNetwork)) {
-            cbCaps = lastCaps;
+        if (capsHaveCellular(activeCaps)) {
+            ni.onCellular = true;
         }
-        ni.ssid = ssidFromCaps(cbCaps);
-        if (ni.ssid == null) {
-            ni.ssid = ssidFromCaps(activeCaps);
+
+        // 2) One-shot capabilities of the tracked WiFi network.
+        if (ni.ssid == null && tracked != null && cm != null) {
+            try {
+                String s = ssidFromCaps(cm.getNetworkCapabilities(tracked));
+                if (s != null) {
+                    ni.ssid = s;
+                    ni.ssidSource = SRC_ONESHOT;
+                    ni.onWifi = true;
+                }
+            } catch (Exception e) {
+                // fall through
+            }
         }
-        String wmSsid = null;
+
+        // 3) WifiManager (supplements both the SSID and "on WiFi").
         boolean wmConnected = false;
         try {
             WifiManager wm = (WifiManager) getApplicationContext()
                     .getSystemService(Context.WIFI_SERVICE);
             if (wm != null) {
-                WifiInfo info = wm.getConnectionInfo();
-                if (info != null && info.getNetworkId() != -1) {
+                WifiInfo wi = wm.getConnectionInfo();
+                if (wi != null && wi.getNetworkId() != -1) {
                     wmConnected = true;
-                    wmSsid = cleanSsid(info.getSSID());
+                    if (ni.ssid == null) {
+                        String s = cleanSsid(wi.getSSID());
+                        if (s != null) {
+                            ni.ssid = s;
+                            ni.ssidSource = SRC_WIFIMANAGER;
+                        }
+                    }
                 }
             }
         } catch (Exception e) {
             // no WiFi info available
         }
-        if (ni.ssid == null) {
-            ni.ssid = wmSsid;
+        if (wmConnected) {
+            ni.onWifi = true;
         }
-        ni.onWifi = capsHaveWifi(cbCaps) || capsHaveWifi(activeCaps) || wmConnected;
+
+        // 4) Last resort for "on WiFi": the active network's transports.
+        // (Its SSID via one-shot caps is redacted too often to lead with,
+        // but the transport bit is reliable.)
+        if (!ni.onWifi && capsHaveWifi(activeCaps)) {
+            ni.onWifi = true;
+            if (ni.ssid == null) {
+                String s = ssidFromCaps(activeCaps);
+                if (s != null) {
+                    ni.ssid = s;
+                    ni.ssidSource = SRC_ONESHOT;
+                }
+            }
+        }
         return ni;
     }
 
@@ -291,46 +401,78 @@ public class SwitchService extends Service {
         return s;
     }
 
+    private static String describe(NetInfo ni) {
+        if (ni.onWifi) {
+            return ni.ssid == null ? "WiFi, name unknown" : "WiFi " + ni.ssid;
+        }
+        return ni.onCellular ? "no WiFi, mobile data" : "no network";
+    }
+
+    private static String where(NetInfo ni) {
+        if (ni.onWifi) {
+            return ni.ssid == null ? "WiFi (name unknown)" : "WiFi " + ni.ssid;
+        }
+        return ni.onCellular ? "mobile data" : "no network";
+    }
+
     private void evaluate() {
         NetInfo ni = readNet();
         prefs.setLastNet(ni.onWifi, ni.ssid);
+
+        // Diagnostic trail: log whenever the reading itself changes (which
+        // network, which name), with the source that produced the SSID, so
+        // a misread is visible in the log without a state change having to
+        // happen first. Repeated identical readings log nothing.
+        String sig = ni.onWifi
+                ? "W|" + (ni.ssid == null ? "" : ni.ssid)
+                : (ni.onCellular ? "CELL" : "NONE");
+        if (!sig.equals(lastEvalSig)) {
+            lastEvalSig = sig;
+            prefs.addLog("Eval: " + describe(ni) + " (via " + ni.ssidSource + ")");
+        }
+
+        if (ni.ssid != null) {
+            // A positively read name ends any unknown stretch; only this
+            // resets the hold-log throttle (a merely unreadable or absent
+            // WiFi in between must not re-arm it).
+            ssidUnknownLogged = false;
+        }
         if (ni.onWifi && ni.ssid == null) {
-            // Connected to WiFi but the SSID is unreadable (redacted),
-            // so the network name is unknown. That is not evidence of
-            // being Away: hold the current state, start no debounce and
-            // change nothing. Away requires positive evidence (WiFi gone,
-            // or a positively read SSID that is not a home network).
+            // Connected to WiFi but every read came back redacted, so the
+            // network name is unknown. That is not evidence of being Away:
+            // hold the current state, start no debounce, change nothing.
+            // Away requires positive evidence (WiFi gone, or a positively
+            // read SSID that is not a home network).
             cancelPending();
             pendingState = "";
             pendingSince = 0;
-            if (!unknownHold) {
-                unknownHold = true;
-                prefs.addLog("SSID unknown, holding state");
+            if (!ssidUnknownLogged) {
+                ssidUnknownLogged = true;
+                prefs.addLog("SSID unknown, holding state (via " + ni.ssidSource + ")");
             }
             updateNotification(ni);
             sendRefresh();
             return;
         }
-        unknownHold = false;
-
-        String target = ni.ssid != null && prefs.getHomeSsids().contains(ni.ssid)
-                ? Prefs.STATE_HOME
-                // not a home network (or no network at all)
-                : Prefs.STATE_AWAY;
-
+        String raw;
+        if (ni.ssid != null && prefs.getHomeSsids().contains(ni.ssid)) {
+            raw = Prefs.STATE_HOME;
+        } else {
+            raw = Prefs.STATE_AWAY;
+        }
         String commanded = prefs.getCommandedState();
-        if (target.equals(commanded)) {
+        if (raw.equals(commanded)) {
             pendingState = "";
             pendingSince = 0;
             cancelPending();
         } else {
             long now = System.currentTimeMillis();
-            if (!target.equals(pendingState)) {
-                pendingState = target;
+            if (!raw.equals(pendingState)) {
+                pendingState = raw;
                 pendingSince = now;
                 schedulePending(DEBOUNCE_MS);
             } else if (now - pendingSince >= DEBOUNCE_MS) {
-                fire(target, ni);
+                fire(raw, ni);
             } else {
                 schedulePending(DEBOUNCE_MS - (now - pendingSince));
             }
@@ -359,12 +501,12 @@ public class SwitchService extends Service {
 
     private void fire(String state, NetInfo ni) {
         boolean home = Prefs.STATE_HOME.equals(state);
-        Intent intent = new Intent();
-        intent.setComponent(new ComponentName(TS_PACKAGE, TS_RECEIVER));
-        intent.setAction(home ? TS_DISCONNECT : TS_CONNECT);
+        Intent i = new Intent();
+        i.setComponent(new ComponentName(TS_PACKAGE, TS_RECEIVER));
+        i.setAction(home ? TS_DISCONNECT : TS_CONNECT);
         boolean sent = true;
         try {
-            sendBroadcast(intent);
+            sendBroadcast(i);
         } catch (Exception e) {
             sent = false;
         }
@@ -374,24 +516,19 @@ public class SwitchService extends Service {
             action = action + " (broadcast failed)";
         }
         prefs.setLastAction(action, System.currentTimeMillis());
-        String where;
-        if (ni.onWifi) {
-            where = ni.ssid == null ? "WiFi (name unknown)" : "WiFi " + ni.ssid;
-        } else {
-            where = "mobile data";
-        }
-        prefs.addLog((home ? Prefs.STATE_HOME : Prefs.STATE_AWAY) + " on " + where
-                + " -> " + (home ? "DISCONNECT" : "CONNECT"));
+        prefs.addLog((home ? "HOME" : "AWAY") + " on " + where(ni)
+                + " (via " + ni.ssidSource + ") -> "
+                + (home ? "DISCONNECT" : "CONNECT"));
         pendingState = "";
         pendingSince = 0;
     }
 
     private void createChannel() {
         if (Build.VERSION.SDK_INT >= 26) {
-            NotificationChannel ch = new NotificationChannel(CHANNEL_ID, "VPN Switch status", NotificationManager.IMPORTANCE_LOW);
-
+            NotificationChannel ch = new NotificationChannel(
+                    CHANNEL_ID, "VPN Switch status", NotificationManager.IMPORTANCE_LOW);
             ch.setDescription("Shows whether Tailscale is off (home) or on (away)");
-            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
             if (nm != null) {
                 nm.createNotificationChannel(ch);
             }
@@ -400,19 +537,13 @@ public class SwitchService extends Service {
 
     private Notification buildNotification(NetInfo ni) {
         String state = prefs.getCommandedState();
-        String where;
-        if (ni.onWifi) {
-            where = ni.ssid == null ? "WiFi (name unknown)" : ni.ssid;
-        } else {
-            where = "mobile data";
-        }
         String text;
         if (Prefs.STATE_HOME.equals(state)) {
-            text = "Home · Tailscale off · " + where;
+            text = "Home · Tailscale off · " + where(ni);
         } else if (Prefs.STATE_AWAY.equals(state)) {
-            text = "Away · Tailscale on · " + where;
+            text = "Away · Tailscale on · " + where(ni);
         } else {
-            text = "Watching · " + where;
+            text = "Watching · " + where(ni);
         }
         long last = prefs.getLastActionTime();
         if (last > 0) {
@@ -436,15 +567,15 @@ public class SwitchService extends Service {
     }
 
     private void updateNotification(NetInfo ni) {
-        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
         if (nm != null) {
             nm.notify(NOTIF_ID, buildNotification(ni));
         }
     }
 
     private void sendRefresh() {
-        Intent intent = new Intent(ACTION_UI_REFRESH);
-        intent.setPackage(getPackageName());
-        sendBroadcast(intent);
+        Intent i = new Intent(ACTION_UI_REFRESH);
+        i.setPackage(getPackageName());
+        sendBroadcast(i);
     }
 }
