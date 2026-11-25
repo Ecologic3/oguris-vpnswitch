@@ -20,5 +20,5 @@ home networks and on everywhere else.
   `oguris-vpnswitch.keystore` (alias `oguris-vpnswitch`), the same
   per-app keystore convention as the other Oguri apps; future updates
   of this app must keep using it.
-- Package `app.oguri.vpnswitch`, version 1.0 (versionCode 1),
+- Package `app.oguri.vpnswitch`, version 1.1 (versionCode 2),
   minSdk 29, targetSdk 34.
