@@ -28,19 +28,24 @@ import android.os.Looper;
  *   com.tailscale.ipn.DISCONNECT_VPN -> disconnect
  * The USE_EXIT_NODE broadcast is never used (clearing an exit node that way
  * is a documented crash-loop poison pill). The service is fully
- * event-driven (since 1.5): there is no polling loop and no stability
- * delay. Evaluations run on service start, on network callback events and
- * on UI-triggered re-evaluation, and a broadcast is sent only on a state
- * transition, immediately, in the evaluation that first produces the new
- * state. A redacted SSID read while WiFi stays connected is not a
- * transition either: the current state is held until a read produces
- * positive evidence.
- * The one exception to "no timers" is the re-check scoped to that
- * hold state: right after joining a WiFi the SSID can stay unreadable
- * with no callback announcing its arrival, so while the name is
- * unknown the service re-evaluates every 3 s, at most 12 attempts,
+ * event-driven (since 1.5): there is no standing polling loop and no
+ * stability delay. Evaluations run on service start, on network callback
+ * events and on UI-triggered re-evaluation, and a broadcast is sent only
+ * on a state transition, immediately, in the evaluation that first
+ * produces the new state. A redacted SSID read while WiFi stays
+ * connected is not a transition either: the current state is held until
+ * a read produces positive evidence. The one exception to "no timers"
+ * is the re-check scoped to exactly that hold state (1.6, extended in
+ * 1.8): right after joining a WiFi the SSID can stay unreadable with
+ * no callback announcing its arrival, so while the name is unknown
+ * the service re-evaluates every 3 s for the first 12 attempts, then
+ * every 20 s with no attempt cap for as long as the hold persists,
  * and stops the moment the name lands, the WiFi goes away, or a
- * switch fires; nothing else in the service runs on a timer.
+ * switch fires. The slow phase exists because the 1.7 gate removed
+ * the flicker evaluations that used to re-run the reads after the
+ * burst ended, while the callback-delivered WifiInfo can stay
+ * redacted for minutes at a time; without it, a name that only the
+ * WifiManager fallback in readNet() can see would never be re-read.
  *
  * Since 1.7 the callbacks are also gated so stationary capability
  * churn costs no reads: onCapabilitiesChanged fires for pure
@@ -50,12 +55,12 @@ import android.os.Looper;
  * distill each delivery into an identity signature (network handle,
  * SSID, BSSID) that deliberately excludes signal strength, link
  * speed and every other fast-changing field, and only a changed
- * signature (or onAvailable / onLost, which always evaluate) runs
- * an evaluation. A delivery whose WifiInfo newly carries a
- * readable SSID changes the signature, so the name-landing moment
- * is never gated away. readNet() matches this: when the tracker's
- * delivered WifiInfo already yields a known SSID it returns at
- * once, without the one-shot capabilities read and without WifiManager.
+ * signature (or onAvailable / onLost, which always evaluate) runs an
+ * evaluation. A delivery whose WifiInfo newly carries a readable
+ * SSID changes the signature, so the name-landing moment is never
+ * gated away. readNet() matches this: when the tracker's delivered
+ * WifiInfo already yields a known SSID it returns at once, without
+ * the one-shot capabilities read and without WifiManager.
  *
  * Network truth comes from dedicated callbacks, not from the default
  * network: once a VPN is up the default network IS the VPN, so reads keyed
@@ -76,11 +81,17 @@ public class SwitchService extends Service {
     private static final String OLD_CHANNEL_ID = "vpnswitch";
     private static final int NOTIF_ID = 1;
 
-    // v1.6: the unknown-hold re-check (see evaluate()): while the
-    // connected WiFi's SSID is unreadable, re-evaluate every 3 s,
-    // at most 12 attempts (~36 s of coverage).
+    // v1.6: phase 1 of the unknown-hold re-check (see evaluate()):
+    // while the connected WiFi's SSID is unreadable, re-evaluate
+    // every 3 s, at most 12 attempts (~36 s of coverage).
     private static final long BURST_INTERVAL_MS = 3000;
     private static final int BURST_MAX_ATTEMPTS = 12;
+
+    // v1.8: phase 2 of the unknown-hold re-check. If the SSID is
+    // still unreadable when phase 1 is exhausted, keep re-evaluating
+    // every 20 s with no attempt cap for as long as the unknown-hold
+    // state persists.
+    private static final long BURST_SLOW_INTERVAL_MS = 20000;
 
     private static final String TS_PACKAGE = "com.tailscale.ipn";
     private static final String TS_RECEIVER = "com.tailscale.ipn.IPNReceiver";
@@ -110,29 +121,44 @@ public class SwitchService extends Service {
     private volatile String lastCellSig;
     private boolean ssidUnknownLogged = false;
     private String lastEvalSig = null;
-    // Unknown-hold re-check state (v1.6): burstActive is true
-    // while the re-check is scheduled and burstCount counts the
-    // re-reads already done; the tick is the only delayed callback.
+    // Unknown-hold re-check state (v1.6, two-phase since v1.8):
+    // burstActive is true while the re-check is scheduled, burstCount
+    // counts the fast-phase re-reads already done, and burstSlow is
+    // true once the loop has moved to the uncapped 20 s phase. The
+    // re-check tick is the only delayed callback in the service.
     private boolean burstActive = false;
     private int burstCount = 0;
+    private boolean burstSlow = false;
     private final Runnable burstTick = new Runnable() {
         @Override
         public void run() {
             if (!burstActive) {
                 return;
             }
-            burstCount++;
+            if (!burstSlow) {
+                burstCount++;
+            }
             evaluate();
             // evaluate() stops the re-check when the reading resolves
             // (name read, WiFi gone, switch fired). If the name is
-            // still unreadable, line up the next attempt until the
-            // cap is reached; at the cap the burst simply ends,
-            // leaving no timer behind.
+            // still unreadable, line up the next attempt: fast (3 s)
+            // until the phase-1 cap, then slow (20 s) with no cap
+            // for as long as the hold persists.
             if (burstActive) {
-                if (burstCount >= BURST_MAX_ATTEMPTS || handler == null) {
+                if (handler == null) {
                     stopBurst();
+                } else if (!burstSlow && burstCount >= BURST_MAX_ATTEMPTS) {
+                    // Phase 1 exhausted and the name is still
+                    // unreadable: move to the slow phase instead of
+                    // stopping, so a name that surfaces minutes later
+                    // (the v1.7 field case) is still caught. Logged
+                    // exactly once, here at the transition.
+                    burstSlow = true;
+                    prefs.addLog("WiFi name still not readable, checking every 20s");
+                    handler.postDelayed(this, BURST_SLOW_INTERVAL_MS);
                 } else {
-                    handler.postDelayed(this, BURST_INTERVAL_MS);
+                    handler.postDelayed(this, burstSlow
+                            ? BURST_SLOW_INTERVAL_MS : BURST_INTERVAL_MS);
                 }
             }
         }
@@ -544,10 +570,10 @@ public class SwitchService extends Service {
         }
 
         if (ni.ssid != null) {
-            // A positively read name ends any unknown stretch; only
-            // this resets the hold-log throttle (a merely unreadable
-            // or absent WiFi must not re-arm it). It also ends the
-            // re-read burst: the name it waited for is here.
+            // A positively read name ends any unknown stretch; only this
+            // resets the hold-log throttle (a merely unreadable or absent
+            // WiFi in between must not re-arm it). It also ends the
+            // re-read burst: the name the burst was waiting for is here.
             ssidUnknownLogged = false;
             stopBurst();
         }
@@ -557,8 +583,9 @@ public class SwitchService extends Service {
             // hold the current state and change nothing. Away requires
             // positive evidence (WiFi gone, or a positively read SSID
             // that is not a home network). The name often only surfaces
-            // seconds after the join, and no callback may announce it,
-            // so the hold state runs the re-check burst (see startBurst()).
+            // seconds (or, while the callback WifiInfo stays redacted,
+            // minutes) after the join, and no callback may announce it,
+            // so the hold state runs the two-phase re-check (v1.6/v1.8).
             if (!ssidUnknownLogged) {
                 ssidUnknownLogged = true;
                 prefs.addLog("SSID unknown, holding state (via " + ni.ssidSource + ")");
@@ -593,10 +620,15 @@ public class SwitchService extends Service {
     /**
      * Starts the unknown-hold re-check if one is not already running
      * (evaluate() calls this on every hold evaluation; the no-op here
-     * is what keeps the loop single). The re-check re-runs evaluate()
-     * every BURST_INTERVAL_MS, at most BURST_MAX_ATTEMPTS times, and
-     * exists only while the connected WiFi's SSID is unreadable.
-     * Logged once here; attempts show up as Eval lines when they change.
+     * is what keeps the loop single). Phase 1 (v1.6) re-runs
+     * evaluate() every BURST_INTERVAL_MS, at most BURST_MAX_ATTEMPTS
+     * times; if the SSID is still unreadable when phase 1 ends, the
+     * tick moves the loop to phase 2 (v1.8), re-running every
+     * BURST_SLOW_INTERVAL_MS with no cap until the hold ends. The
+     * re-check exists only while the connected WiFi's SSID is
+     * unreadable. Logged once here, and once more when phase 2
+     * begins; the per-attempt readings show up as Eval lines when
+     * they change.
      */
     private void startBurst() {
         if (burstActive || handler == null) {
@@ -604,14 +636,20 @@ public class SwitchService extends Service {
         }
         burstActive = true;
         burstCount = 0;
+        burstSlow = false;
         prefs.addLog("WiFi name not readable yet, re-checking");
         handler.postDelayed(burstTick, BURST_INTERVAL_MS);
     }
 
-    /** Cancels the unknown-hold re-check, if any. Safe to call at any time. */
+    /**
+     * Cancels the unknown-hold re-check (either phase), if any, and
+     * resets it so the next hold starts again at phase 1. Safe to
+     * call at any time.
+     */
     private void stopBurst() {
         burstActive = false;
         burstCount = 0;
+        burstSlow = false;
         if (handler != null) {
             handler.removeCallbacks(burstTick);
         }

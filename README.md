@@ -7,10 +7,10 @@ home networks and on everywhere else.
   (`com.tailscale.ipn.CONNECT_VPN` / `com.tailscale.ipn.DISCONNECT_VPN`),
   sent only on state transitions. The service is fully event-driven:
   network callbacks trigger an evaluation and a definite new state
-  fires its broadcast in that same evaluation, with no polling loop
-  and no stability delay (the one exception is the unknown-hold
-  re-check below: a bounded 3 s burst while the WiFi name stays
-  unreadable). The `USE_EXIT_NODE` broadcast is never used (clearing an
+  fires its broadcast in that same evaluation, with no standing
+  polling loop and no stability delay (the one exception is the
+  unknown-hold re-check below: a bounded 3 s burst, then a 20 s
+  re-check for as long as the name stays unreadable). The `USE_EXIT_NODE` broadcast is never used (clearing an
   exit node that way is a documented crash-loop poison pill). When
   Tailscale reconnects it restores the selected exit node by itself.
 - Monitoring runs in a foreground service (`specialUse` type, the same
@@ -27,7 +27,7 @@ home networks and on everywhere else.
   `oguris-vpnswitch.keystore` (alias `oguris-vpnswitch`), the same
   per-app keystore convention as the other Oguri apps; future updates
   of this app must keep using it.
-- Package `app.oguri.vpnswitch`, version 1.7 (versionCode 8),
+- Package `app.oguri.vpnswitch`, version 1.8 (versionCode 9),
   minSdk 29, targetSdk 34.
 - v1.4: the foreground-service status notification moved to a new
   IMPORTANCE_MIN channel (`vpnswitch_status_min`; the v1.0-v1.3 channel
@@ -64,3 +64,18 @@ home networks and on everywhere else.
   one-shot capabilities read and without the WifiManager read. The
   1.6 burst, the hold semantics and the transition-only broadcasts
   are untouched; the trim only removes stationary flicker reads.
+- v1.8: the unknown-hold re-check becomes two-phase. The 1.7 gate
+  removed the flicker evaluations that used to keep re-running
+  readNet() after the 1.6 burst ended, and in the field the
+  callback-delivered WifiInfo can stay redacted for minutes at a
+  time, so when the burst ended (~36 s) nothing was left to catch
+  the name once it finally surfaced via the WifiManager fallback:
+  the phone sat on home WiFi with Tailscale still on. The re-check
+  now runs the 1.6 fast burst first (3 s, at most 12 attempts),
+  then, if the name is still unreadable, keeps re-evaluating every
+  20 s with no attempt cap for as long as the unknown-hold state
+  persists, logging one line when the slow phase begins. It still
+  cancels the moment a name is read, the WiFi drops, a switch
+  fires, or the service stops. The 1.7 gate, the readNet()
+  short-circuit, the hold semantics and the transition-only
+  broadcasts are unchanged.
