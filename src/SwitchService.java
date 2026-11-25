@@ -28,7 +28,9 @@ import android.os.Looper;
  * The USE_EXIT_NODE broadcast is never used (clearing an exit node that way
  * is a documented crash-loop poison pill). A broadcast is sent only on a
  * state transition, and only after the new state has been stable for about
- * 30 seconds, so brief WiFi drops do not flap the VPN.
+ * 30 seconds, so brief WiFi drops do not flap the VPN. A redacted SSID read
+ * while WiFi stays connected is not a transition either: the current state
+ * is held until a read produces positive evidence.
  */
 public class SwitchService extends Service {
     public static final String ACTION_REEVALUATE = "app.oguri.vpnswitch.REEVALUATE";
@@ -52,6 +54,9 @@ public class SwitchService extends Service {
     private long pendingSince = 0;
     private Runnable pendingRunnable;
     private Runnable recheckRunnable;
+    private NetworkCapabilities lastCaps;
+    private Network lastCapsNetwork;
+    private boolean unknownHold = false;
 
     public static void start(Context context) {
         Intent intent = new Intent(context, SwitchService.class);
@@ -126,26 +131,50 @@ public class SwitchService extends Service {
         if (cm == null) {
             return;
         }
-        callback = new ConnectivityManager.NetworkCallback() {
-            @Override
-            public void onAvailable(Network network) {
-                postEvaluate();
-            }
-
-            @Override
-            public void onLost(Network network) {
-                postEvaluate();
-            }
-
-            @Override
-            public void onCapabilitiesChanged(Network network, NetworkCapabilities caps) {
-                postEvaluate();
-            }
-        };
+        // On Android 12+ (API 31+) the callback must carry
+        // FLAG_INCLUDE_LOCATION_INFO, otherwise the WifiInfo delivered
+        // to onCapabilitiesChanged is location-redacted ("<unknown ssid>").
+        if (Build.VERSION.SDK_INT >= 31) {
+            callback = new NetCallback(ConnectivityManager.NetworkCallback.FLAG_INCLUDE_LOCATION_INFO);
+        } else {
+            // no location flag in the callback before Android 12
+            callback = new NetCallback();
+        }
         try {
             cm.registerDefaultNetworkCallback(callback);
         } catch (Exception e) {
-            // monitoring continues via the recheck
+            // monitoring continues via the one-shot reads and the recheck
+        }
+    }
+
+    private class NetCallback extends ConnectivityManager.NetworkCallback {
+        NetCallback() {
+            super();
+        }
+
+        NetCallback(int flags) {
+            super(flags);
+        }
+
+        @Override
+        public void onAvailable(Network network) {
+            postEvaluate();
+        }
+
+        @Override
+        public void onLost(Network network) {
+            if (network != null && network.equals(lastCapsNetwork)) {
+                lastCaps = null;
+                lastCapsNetwork = null;
+            }
+            postEvaluate();
+        }
+
+        @Override
+        public void onCapabilitiesChanged(Network network, NetworkCapabilities caps) {
+            lastCapsNetwork = network;
+            lastCaps = caps;
+            postEvaluate();
         }
     }
 
@@ -176,44 +205,76 @@ public class SwitchService extends Service {
         String ssid;
     }
 
+    private static boolean capsHaveWifi(NetworkCapabilities caps) {
+        return caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI);
+    }
+
+    private static String ssidFromCaps(NetworkCapabilities caps) {
+        if (!capsHaveWifi(caps)) {
+            return null;
+        }
+        if (Build.VERSION.SDK_INT >= 31) {
+            Object info = caps.getTransportInfo();
+            if (info instanceof WifiInfo) {
+                return cleanSsid(((WifiInfo) info).getSSID());
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The single network-reading path used by every evaluation (service
+     * start, network callbacks, the periodic recheck). The callback's
+     * latest capabilities are the primary SSID source; one-shot reads of
+     * the active network and WifiManager.getConnectionInfo() only
+     * supplement it, and any positively known SSID wins over redacted
+     * ones. The result has ssid == null while onWifi is true when every
+     * source came back redacted; callers must not treat that as evidence
+     * of being away from home.
+     */
     private NetInfo readNet() {
         NetInfo ni = new NetInfo();
         ni.onWifi = false;
         ni.ssid = null;
+        NetworkCapabilities activeCaps = null;
+        Network active = null;
         try {
             if (cm != null) {
-                Network active = cm.getActiveNetwork();
+                active = cm.getActiveNetwork();
                 if (active != null) {
-                    NetworkCapabilities caps = cm.getNetworkCapabilities(active);
-                    if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-                        ni.onWifi = true;
-                        if (Build.VERSION.SDK_INT >= 31) {
-                            Object info = caps.getTransportInfo();
-                            if (info instanceof WifiInfo) {
-                                ni.ssid = cleanSsid(((WifiInfo) info).getSSID());
-                            }
-                        }
-                    }
+                    activeCaps = cm.getNetworkCapabilities(active);
                 }
             }
         } catch (Exception e) {
-            // fall through to WifiManager
+            // fall through to the other candidates
+        }
+        NetworkCapabilities cbCaps = null;
+        if (lastCaps != null && active != null && active.equals(lastCapsNetwork)) {
+            cbCaps = lastCaps;
+        }
+        ni.ssid = ssidFromCaps(cbCaps);
+        if (ni.ssid == null) {
+            ni.ssid = ssidFromCaps(activeCaps);
+        }
+        String wmSsid = null;
+        boolean wmConnected = false;
+        try {
+            WifiManager wm = (WifiManager) getApplicationContext()
+                    .getSystemService(Context.WIFI_SERVICE);
+            if (wm != null) {
+                WifiInfo info = wm.getConnectionInfo();
+                if (info != null && info.getNetworkId() != -1) {
+                    wmConnected = true;
+                    wmSsid = cleanSsid(info.getSSID());
+                }
+            }
+        } catch (Exception e) {
+            // no WiFi info available
         }
         if (ni.ssid == null) {
-            try {
-                WifiManager wm = (WifiManager) getApplicationContext()
-                        .getSystemService(Context.WIFI_SERVICE);
-                if (wm != null) {
-                    WifiInfo info = wm.getConnectionInfo();
-                    if (info != null && info.getNetworkId() != -1) {
-                        ni.onWifi = true;
-                        ni.ssid = cleanSsid(info.getSSID());
-                    }
-                }
-            } catch (Exception e) {
-                // no WiFi info available
-            }
+            ni.ssid = wmSsid;
         }
+        ni.onWifi = capsHaveWifi(cbCaps) || capsHaveWifi(activeCaps) || wmConnected;
         return ni;
     }
 
@@ -233,6 +294,24 @@ public class SwitchService extends Service {
     private void evaluate() {
         NetInfo ni = readNet();
         prefs.setLastNet(ni.onWifi, ni.ssid);
+        if (ni.onWifi && ni.ssid == null) {
+            // Connected to WiFi but the SSID is unreadable (redacted),
+            // so the network name is unknown. That is not evidence of
+            // being Away: hold the current state, start no debounce and
+            // change nothing. Away requires positive evidence (WiFi gone,
+            // or a positively read SSID that is not a home network).
+            cancelPending();
+            pendingState = "";
+            pendingSince = 0;
+            if (!unknownHold) {
+                unknownHold = true;
+                prefs.addLog("SSID unknown, holding state");
+            }
+            updateNotification(ni);
+            sendRefresh();
+            return;
+        }
+        unknownHold = false;
 
         String target = ni.ssid != null && prefs.getHomeSsids().contains(ni.ssid)
                 ? Prefs.STATE_HOME

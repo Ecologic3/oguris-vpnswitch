@@ -85,8 +85,9 @@ public class MainActivity extends Activity {
 
         hintUnknown = new TextView(this);
         hintUnknown.setText("\nWiFi name is hidden right now. Android only reveals it with "
-                + "location permission granted and location services switched on. Until then "
-                + "this counts as Away, so Tailscale stays on (the safe direction).\n");
+                + "location permission granted and location services switched on. While the "
+                + "name is unreadable the app cannot tell home from away, so it holds its "
+                + "current state and does not switch.\n");
         hintUnknown.setTextSize(14);
         root.addView(hintUnknown);
 
