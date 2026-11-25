@@ -23,5 +23,10 @@ home networks and on everywhere else.
   `oguris-vpnswitch.keystore` (alias `oguris-vpnswitch`), the same
   per-app keystore convention as the other Oguri apps; future updates
   of this app must keep using it.
-- Package `app.oguri.vpnswitch`, version 1.3 (versionCode 4),
+- Package `app.oguri.vpnswitch`, version 1.4 (versionCode 5),
   minSdk 29, targetSdk 34.
+- v1.4: the foreground-service status notification moved to a new
+  IMPORTANCE_MIN channel (`vpnswitch_status_min`; the v1.0-v1.3 channel
+  `vpnswitch` is deleted on service start) with a short state-only
+  title, so it shows no status-bar icon and sits minimized at the
+  bottom of the shade. Switching logic unchanged.

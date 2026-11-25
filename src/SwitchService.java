@@ -44,7 +44,12 @@ public class SwitchService extends Service {
     public static final String ACTION_REEVALUATE = "app.oguri.vpnswitch.REEVALUATE";
     public static final String ACTION_UI_REFRESH = "app.oguri.vpnswitch.UI_REFRESH";
 
-    private static final String CHANNEL_ID = "vpnswitch";
+    // v1.4: the status notification moved to a fresh channel id at
+    // IMPORTANCE_MIN. A channel's importance locks at first creation, so
+    // the v1.0-v1.3 channel (OLD_CHANNEL_ID, IMPORTANCE_LOW) could never be
+    // made quieter in place on an installed phone; it is deleted instead.
+    private static final String CHANNEL_ID = "vpnswitch_status_min";
+    private static final String OLD_CHANNEL_ID = "vpnswitch";
     private static final int NOTIF_ID = 1;
     private static final long DEBOUNCE_MS = 30000;
     private static final long RECHECK_MS = 60000;
@@ -525,29 +530,52 @@ public class SwitchService extends Service {
 
     private void createChannel() {
         if (Build.VERSION.SDK_INT >= 26) {
-            NotificationChannel ch = new NotificationChannel(
-                    CHANNEL_ID, "VPN Switch status", NotificationManager.IMPORTANCE_LOW);
-            ch.setDescription("Shows whether Tailscale is off (home) or on (away)");
             NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-            if (nm != null) {
-                nm.createNotificationChannel(ch);
+            if (nm == null) {
+                return;
             }
+            // Remove the pre-1.4 channel so it does not linger in the
+            // app's notification settings.
+            try {
+                nm.deleteNotificationChannel(OLD_CHANNEL_ID);
+            } catch (Exception e) {
+                // nothing to delete
+            }
+            // IMPORTANCE_MIN: no status-bar icon, collapsed to the
+            // minimized section at the bottom of the shade. A foreground
+            // service must carry a notification; this is as close to
+            // invisible as Android allows.
+            NotificationChannel ch = new NotificationChannel(
+                    CHANNEL_ID, "VPN Switch status", NotificationManager.IMPORTANCE_MIN);
+            ch.setDescription("Quiet status for the Tailscale switching service");
+            ch.setSound(null, null);
+            ch.enableVibration(false);
+            ch.setLockscreenVisibility(Notification.VISIBILITY_SECRET);
+            ch.setShowBadge(false);
+            nm.createNotificationChannel(ch);
         }
     }
 
     private Notification buildNotification(NetInfo ni) {
+        // Minimal footprint: the title carries the short state line and
+        // the detail (network, last switch) stays as plain content text
+        // for when the shade is pulled down. No expanded style.
         String state = prefs.getCommandedState();
+        String title;
         String text;
         if (Prefs.STATE_HOME.equals(state)) {
-            text = "Home · Tailscale off · " + where(ni);
+            title = "VPN Switch \u00B7 Home";
+            text = "Tailscale off \u00B7 " + where(ni);
         } else if (Prefs.STATE_AWAY.equals(state)) {
-            text = "Away · Tailscale on · " + where(ni);
+            title = "VPN Switch \u00B7 Away";
+            text = "Tailscale on \u00B7 " + where(ni);
         } else {
-            text = "Watching · " + where(ni);
+            title = "VPN Switch \u00B7 Watching";
+            text = where(ni);
         }
         long last = prefs.getLastActionTime();
         if (last > 0) {
-            text = text + " · last switch " + Prefs.formatTime(last);
+            text = text + " \u00B7 last switch " + Prefs.formatTime(last);
         }
         Intent open = new Intent(this, MainActivity.class);
         PendingIntent pi = PendingIntent.getActivity(this, 0, open,
@@ -558,11 +586,13 @@ public class SwitchService extends Service {
         } else {
             b = new Notification.Builder(this);
         }
-        b.setContentTitle("Oguri VPN Switch");
+        b.setContentTitle(title);
         b.setContentText(text);
         b.setSmallIcon(android.R.drawable.ic_dialog_info);
         b.setContentIntent(pi);
         b.setOngoing(true);
+        b.setPriority(Notification.PRIORITY_MIN);
+        b.setVisibility(Notification.VISIBILITY_SECRET);
         return b.build();
     }
 
