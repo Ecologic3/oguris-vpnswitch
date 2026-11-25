@@ -19,10 +19,12 @@ import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.PowerManager;
 import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -70,6 +72,9 @@ public class MainActivity extends Activity {
     private Button toggleButton;
     private Button logToggleButton;
     private Button addCurrentButton;
+    private LinearLayout permCard;
+    private Button permButton;
+    private Button batteryButton;
     private LinearLayout networksContainer;
     private BroadcastReceiver refreshReceiver;
     private boolean receiverRegistered = false;
@@ -152,6 +157,7 @@ public class MainActivity extends Activity {
     private Button makeButton(String label, View.OnClickListener listener) {
         Button b = new Button(this);
         b.setText(label);
+        b.setAllCaps(false);
         b.setTextSize(15);
         b.setTextColor(COL_TEXT);
         b.setBackground(buttonBg(COL_BTN, COL_BTN_PRESSED, COL_BTN_DISABLED));
@@ -184,14 +190,26 @@ public class MainActivity extends Activity {
         root.setBackgroundColor(COL_BG);
         root.setPadding(dp(20), dp(20), dp(20), dp(24));
 
-        TextView title = makeText("Oguri VPN Switch", 26, COL_TEXT);
-        title.setTypeface(Typeface.DEFAULT_BOLD);
-        root.addView(title);
+        // Header row, the same shape as Oguri's Alarms: the title on
+        // the left and the app's own launcher icon at the top right.
+        LinearLayout headerRow = new LinearLayout(this);
+        headerRow.setOrientation(LinearLayout.HORIZONTAL);
+        headerRow.setGravity(Gravity.CENTER_VERTICAL);
+        root.addView(headerRow);
 
-        TextView sub = makeText("Tailscale off on your home WiFi, on everywhere else.",
-                14, COL_MUTED);
-        sub.setPadding(0, dp(4), 0, 0);
-        root.addView(sub);
+        TextView title = makeText("Oguri's VPN Switch", 30, COL_TEXT);
+        title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        headerRow.addView(title, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        try {
+            ImageView icon = new ImageView(this);
+            icon.setImageDrawable(getPackageManager().getApplicationIcon(
+                    getApplicationInfo()));
+            headerRow.addView(icon, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        } catch (Exception ignored) {
+            // No icon is cosmetic only; the header works without it.
+        }
 
         // Status block.
         LinearLayout statusCard = makeCard(16);
@@ -256,14 +274,15 @@ public class MainActivity extends Activity {
         toggleButton.setLayoutParams(lp(14));
         root.addView(toggleButton);
 
-        // Permissions: explanation text, then the two buttons.
-        LinearLayout permCard = makeCard(12);
+        // Permissions: explanation text, then the two buttons. The
+        // buttons phase out in refresh() once granted (see there).
+        permCard = makeCard(12);
         TextView permInfo = makeText("Android requires location permission to read "
                 + "the WiFi name. Without it the app cannot tell home WiFi from "
                 + "any other network.", 14, COL_MUTED);
         permCard.addView(permInfo);
 
-        Button permButton = makeButton("Grant location permission",
+        permButton = makeButton("Grant location permission",
                 new View.OnClickListener() {
                     @Override
                     public void onClick(View v) {
@@ -282,7 +301,7 @@ public class MainActivity extends Activity {
         permButton.setLayoutParams(lp(10));
         permCard.addView(permButton);
 
-        Button batteryButton = makeButton("Battery exemption",
+        batteryButton = makeButton("Battery exemption",
                 new View.OnClickListener() {
                     @Override
                     public void onClick(View v) {
@@ -510,6 +529,7 @@ public class MainActivity extends Activity {
 
             Button remove = new Button(this);
             remove.setText("Remove");
+            remove.setAllCaps(false);
             remove.setTextSize(13);
             remove.setTextColor(COL_REMOVE);
             remove.setBackground(buttonBg(COL_REMOVE_BG, COL_REMOVE_BG_PRESSED,
@@ -601,9 +621,32 @@ public class MainActivity extends Activity {
         hintUnknown.setVisibility(onWifi && ssid.length() == 0 ? View.VISIBLE : View.GONE);
         noteNoTailscale.setVisibility(tailscaleInstalled() ? View.GONE : View.VISIBLE);
 
+        // Permission buttons phase out once granted, the way the
+        // Alarms setup section quiets down: each button disappears
+        // when its permission is in place, and the whole card
+        // (explanation text included) goes once both are granted.
+        // refresh() runs on every resume, so returning from a system
+        // settings screen updates this without a restart.
+        boolean locationOk = checkSelfPermission(
+                Manifest.permission.ACCESS_FINE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED;
+        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        boolean batteryOk = pm != null
+                && pm.isIgnoringBatteryOptimizations(getPackageName());
+        if (permButton != null) {
+            permButton.setVisibility(locationOk ? View.GONE : View.VISIBLE);
+        }
+        if (batteryButton != null) {
+            batteryButton.setVisibility(batteryOk ? View.GONE : View.VISIBLE);
+        }
+        if (permCard != null) {
+            permCard.setVisibility(locationOk && batteryOk
+                    ? View.GONE : View.VISIBLE);
+        }
+
         boolean monitoring = prefs.isMonitoring();
         toggleButton.setText(monitoring
-                ? "Monitoring: ON (tap to stop)" : "Monitoring: OFF (tap to start)");
+                ? "Monitoring: on (tap to stop)" : "Monitoring: off (tap to start)");
         if (monitoring) {
             toggleButton.setBackground(buttonBg(COL_ACCENT, COL_ACCENT_PRESSED,
                     COL_BTN_DISABLED));

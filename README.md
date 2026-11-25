@@ -1,4 +1,4 @@
-# Oguri VPN Switch
+# Oguri's VPN Switch
 
 Watches which WiFi the phone is on and switches Tailscale off on Adam's
 home networks and on everywhere else.
@@ -27,7 +27,7 @@ home networks and on everywhere else.
   `oguris-vpnswitch.keystore` (alias `oguris-vpnswitch`), the same
   per-app keystore convention as the other Oguri apps; future updates
   of this app must keep using it.
-- Package `app.oguri.vpnswitch`, version 1.9 (versionCode 10),
+- Package `app.oguri.vpnswitch`, version 1.10 (versionCode 11),
   minSdk 29, targetSdk 34.
 - v1.4: the foreground-service status notification moved to a new
   IMPORTANCE_MIN channel (`vpnswitch_status_min`; the v1.0-v1.3 channel
@@ -97,3 +97,20 @@ home networks and on everywhere else.
   format: `res/mipmap-anydpi-v26/ic_launcher.xml` over
   `@color/ic_bg`, per-density foreground and legacy PNGs, drawn by
   `icon-src/generate_icon.py` (preview in `icon-preview-1.9.png`).
+- v1.10: final standalone version; MainActivity UI unified with
+  Oguri's Alarms, switching logic untouched, midnight-indigo colors
+  unchanged. The manifest theme is now `Theme.Material.NoActionBar`
+  (the same as Alarms), so the white action-bar strip above the
+  dark UI is gone. The header follows Alarms: a row with the title
+  on the left and the app's own launcher icon (48 dp, via
+  `getApplicationIcon`) at the top right, and the app is renamed
+  "Oguri's VPN Switch" (the 's was missing) in the launcher label
+  and the header. The subheader line under the title is removed.
+  Buttons no longer render in all caps: `setAllCaps(false)` in the
+  button factory (and on the per-row remove button), as in Alarms,
+  and the labels are sentence case ("Monitoring: on (tap to
+  stop)"). The permission buttons phase out once granted: each
+  one disappears when its permission is in place, and the whole
+  permissions card, explanation text included, disappears once
+  both are granted; refresh() runs on resume, so the card updates
+  as soon as the user returns from a system settings screen.
