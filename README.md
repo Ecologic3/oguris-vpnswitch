@@ -8,7 +8,9 @@ home networks and on everywhere else.
   sent only on state transitions. The service is fully event-driven:
   network callbacks trigger an evaluation and a definite new state
   fires its broadcast in that same evaluation, with no polling loop
-  and no stability delay. The `USE_EXIT_NODE` broadcast is never used (clearing an
+  and no stability delay (the one exception is the unknown-hold
+  re-check below: a bounded 3 s burst while the WiFi name stays
+  unreadable). The `USE_EXIT_NODE` broadcast is never used (clearing an
   exit node that way is a documented crash-loop poison pill). When
   Tailscale reconnects it restores the selected exit node by itself.
 - Monitoring runs in a foreground service (`specialUse` type, the same
@@ -25,7 +27,7 @@ home networks and on everywhere else.
   `oguris-vpnswitch.keystore` (alias `oguris-vpnswitch`), the same
   per-app keystore convention as the other Oguri apps; future updates
   of this app must keep using it.
-- Package `app.oguri.vpnswitch`, version 1.5 (versionCode 6),
+- Package `app.oguri.vpnswitch`, version 1.6 (versionCode 7),
   minSdk 29, targetSdk 34.
 - v1.4: the foreground-service status notification moved to a new
   IMPORTANCE_MIN channel (`vpnswitch_status_min`; the v1.0-v1.3 channel
@@ -38,3 +40,13 @@ home networks and on everywhere else.
   re-evaluation, and a definite new state fires its transition
   broadcast in that same evaluation. The unreadable-SSID hold is
   unchanged.
+- v1.6: bounded re-read burst for the unreadable-SSID hold. In the
+  field, WiFi -> mobile data switched instantly, but on return the
+  WiFi was back at 14:49:37 with its SSID still unreadable, and with
+  all polling gone nothing re-read it until a WifiManager fallback
+  read landed 30 s later. Now, while (and only while) the phone is
+  connected to a WiFi whose name is unreadable, the service
+  re-evaluates every 3 s, at most 12 attempts (~36 s), cancelling the
+  moment a name is read, the WiFi drops, a switch fires, or the
+  service stops. Outside that burst there is still no timer anywhere
+  in the service.

@@ -164,6 +164,36 @@ public class MainActivity extends Activity {
         });
         root.addView(batteryButton);
 
+        Button notifButton = new Button(this);
+        notifButton.setText("Hide the status notification");
+        notifButton.setOnClickListener(new View.OnClickListener() {
+            // The app cannot hide its own foreground-service
+            // notification: Android reserves that switch for the
+            // user, so the most the app can do is open its own
+            // notification settings page. Turning notifications
+            // off there hides it for good; the service keeps working.
+            @Override
+            public void onClick(View v) {
+                Intent i = new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS);
+                i.putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName());
+                try {
+                    startActivity(i);
+                } catch (Exception e) {
+                    Intent fallback = new Intent(
+                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+                    fallback.setData(Uri.parse("package:" + getPackageName()));
+                    try {
+                        startActivity(fallback);
+                    } catch (Exception e2) {
+                        Toast.makeText(MainActivity.this,
+                                "Could not open notification settings",
+                                Toast.LENGTH_SHORT).show();
+                    }
+                }
+            }
+        });
+        root.addView(notifButton);
+
         toggleButton = new Button(this);
         toggleButton.setOnClickListener(new View.OnClickListener() {
             @Override

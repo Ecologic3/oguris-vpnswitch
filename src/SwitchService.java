@@ -35,6 +35,12 @@ import android.os.Looper;
  * state. A redacted SSID read while WiFi stays connected is not a
  * transition either: the current state is held until a read produces
  * positive evidence.
+ * The one exception to "no timers" is the re-check scoped to that
+ * hold state: right after joining a WiFi the SSID can stay unreadable
+ * with no callback announcing its arrival, so while the name is
+ * unknown the service re-evaluates every 3 s, at most 12 attempts,
+ * and stops the moment the name lands, the WiFi goes away, or a
+ * switch fires; nothing else in the service runs on a timer.
  *
  * Network truth comes from dedicated callbacks, not from the default
  * network: once a VPN is up the default network IS the VPN, so reads keyed
@@ -54,6 +60,12 @@ public class SwitchService extends Service {
     private static final String CHANNEL_ID = "vpnswitch_status_min";
     private static final String OLD_CHANNEL_ID = "vpnswitch";
     private static final int NOTIF_ID = 1;
+
+    // v1.6: the unknown-hold re-check (see evaluate()): while the
+    // connected WiFi's SSID is unreadable, re-evaluate every 3 s,
+    // at most 12 attempts (~36 s of coverage).
+    private static final long BURST_INTERVAL_MS = 3000;
+    private static final int BURST_MAX_ATTEMPTS = 12;
 
     private static final String TS_PACKAGE = "com.tailscale.ipn";
     private static final String TS_RECEIVER = "com.tailscale.ipn.IPNReceiver";
@@ -77,6 +89,33 @@ public class SwitchService extends Service {
     private volatile Network cellNetwork;
     private boolean ssidUnknownLogged = false;
     private String lastEvalSig = null;
+    // Unknown-hold re-check state (v1.6): burstActive is true
+    // while the re-check is scheduled and burstCount counts the
+    // re-reads already done; the tick is the only delayed callback.
+    private boolean burstActive = false;
+    private int burstCount = 0;
+    private final Runnable burstTick = new Runnable() {
+        @Override
+        public void run() {
+            if (!burstActive) {
+                return;
+            }
+            burstCount++;
+            evaluate();
+            // evaluate() stops the re-check when the reading resolves
+            // (name read, WiFi gone, switch fired). If the name is
+            // still unreadable, line up the next attempt until the
+            // cap is reached; at the cap the burst simply ends,
+            // leaving no timer behind.
+            if (burstActive) {
+                if (burstCount >= BURST_MAX_ATTEMPTS || handler == null) {
+                    stopBurst();
+                } else {
+                    handler.postDelayed(this, BURST_INTERVAL_MS);
+                }
+            }
+        }
+    };
 
     public static void start(Context ctx) {
         Intent svc = new Intent(ctx, SwitchService.class);
@@ -123,6 +162,7 @@ public class SwitchService extends Service {
 
     @Override
     public void onDestroy() {
+        stopBurst();
         if (cm != null) {
             if (wifiCallback != null) {
                 try {
@@ -415,25 +455,34 @@ public class SwitchService extends Service {
         }
 
         if (ni.ssid != null) {
-            // A positively read name ends any unknown stretch; only this
-            // resets the hold-log throttle (a merely unreadable or absent
-            // WiFi in between must not re-arm it).
+            // A positively read name ends any unknown stretch; only
+            // this resets the hold-log throttle (a merely unreadable
+            // or absent WiFi must not re-arm it). It also ends the
+            // re-read burst: the name it waited for is here.
             ssidUnknownLogged = false;
+            stopBurst();
         }
         if (ni.onWifi && ni.ssid == null) {
             // Connected to WiFi but every read came back redacted, so the
             // network name is unknown. That is not evidence of being Away:
             // hold the current state and change nothing. Away requires
             // positive evidence (WiFi gone, or a positively read SSID
-            // that is not a home network).
+            // that is not a home network). The name often only surfaces
+            // seconds after the join, and no callback may announce it,
+            // so the hold state runs the re-check burst (see startBurst()).
             if (!ssidUnknownLogged) {
                 ssidUnknownLogged = true;
                 prefs.addLog("SSID unknown, holding state (via " + ni.ssidSource + ")");
             }
+            startBurst();
             updateNotification(ni);
             sendRefresh();
             return;
         }
+        // Any definite reading that is not the hold state (WiFi gone, or
+        // a positively read name handled above) ends the burst; a
+        // transition fired below makes it moot as well.
+        stopBurst();
         String raw;
         if (ni.ssid != null && prefs.getHomeSsids().contains(ni.ssid)) {
             raw = Prefs.STATE_HOME;
@@ -450,6 +499,33 @@ public class SwitchService extends Service {
         }
         updateNotification(ni);
         sendRefresh();
+    }
+
+    /**
+     * Starts the unknown-hold re-check if one is not already running
+     * (evaluate() calls this on every hold evaluation; the no-op here
+     * is what keeps the loop single). The re-check re-runs evaluate()
+     * every BURST_INTERVAL_MS, at most BURST_MAX_ATTEMPTS times, and
+     * exists only while the connected WiFi's SSID is unreadable.
+     * Logged once here; attempts show up as Eval lines when they change.
+     */
+    private void startBurst() {
+        if (burstActive || handler == null) {
+            return;
+        }
+        burstActive = true;
+        burstCount = 0;
+        prefs.addLog("WiFi name not readable yet, re-checking");
+        handler.postDelayed(burstTick, BURST_INTERVAL_MS);
+    }
+
+    /** Cancels the unknown-hold re-check, if any. Safe to call at any time. */
+    private void stopBurst() {
+        burstActive = false;
+        burstCount = 0;
+        if (handler != null) {
+            handler.removeCallbacks(burstTick);
+        }
     }
 
     private void fire(String state, NetInfo ni) {
