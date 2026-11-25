@@ -42,6 +42,21 @@ import android.os.Looper;
  * and stops the moment the name lands, the WiFi goes away, or a
  * switch fires; nothing else in the service runs on a timer.
  *
+ * Since 1.7 the callbacks are also gated so stationary capability
+ * churn costs no reads: onCapabilitiesChanged fires for pure
+ * signal-strength and link-speed changes while the phone sits still
+ * on one network, and every WiFi-info read counts as a location
+ * access on Android. The WiFi and cellular callbacks therefore
+ * distill each delivery into an identity signature (network handle,
+ * SSID, BSSID) that deliberately excludes signal strength, link
+ * speed and every other fast-changing field, and only a changed
+ * signature (or onAvailable / onLost, which always evaluate) runs
+ * an evaluation. A delivery whose WifiInfo newly carries a
+ * readable SSID changes the signature, so the name-landing moment
+ * is never gated away. readNet() matches this: when the tracker's
+ * delivered WifiInfo already yields a known SSID it returns at
+ * once, without the one-shot capabilities read and without WifiManager.
+ *
  * Network truth comes from dedicated callbacks, not from the default
  * network: once a VPN is up the default network IS the VPN, so reads keyed
  * off it lose the WiFi SSID. A callback registered with a TRANSPORT_WIFI
@@ -87,6 +102,12 @@ public class SwitchService extends Service {
     private volatile Network wifiNetwork;
     private volatile NetworkCapabilities wifiCaps;
     private volatile Network cellNetwork;
+    // v1.7 meaningful-change gate: identity signatures of the last
+    // capabilities delivery each callback evaluated on. Deliveries
+    // whose signature is unchanged (pure signal/link-speed churn)
+    // return without evaluating, so they cost no WiFi-info reads.
+    private volatile String lastWifiSig;
+    private volatile String lastCellSig;
     private boolean ssidUnknownLogged = false;
     private String lastEvalSig = null;
     // Unknown-hold re-check state (v1.6): burstActive is true
@@ -234,6 +255,7 @@ public class SwitchService extends Service {
         @Override
         public void onAvailable(Network network) {
             wifiNetwork = network;
+            lastWifiSig = null;
             postEvaluate();
         }
 
@@ -241,6 +263,15 @@ public class SwitchService extends Service {
         public void onCapabilitiesChanged(Network network, NetworkCapabilities caps) {
             wifiNetwork = network;
             wifiCaps = caps;
+            // v1.7 gate: only an identity change evaluates. The
+            // tracker fields above still track the latest delivery;
+            // what is skipped is the evaluation (and its reads) when
+            // nothing but signal strength or link speed moved.
+            String sig = wifiSignature(network, caps);
+            if (sig.equals(lastWifiSig)) {
+                return;
+            }
+            lastWifiSig = sig;
             postEvaluate();
         }
 
@@ -250,6 +281,7 @@ public class SwitchService extends Service {
                 wifiNetwork = null;
                 wifiCaps = null;
             }
+            lastWifiSig = null;
             postEvaluate();
         }
     }
@@ -259,6 +291,21 @@ public class SwitchService extends Service {
         @Override
         public void onAvailable(Network network) {
             cellNetwork = network;
+            lastCellSig = null;
+            postEvaluate();
+        }
+
+        @Override
+        public void onCapabilitiesChanged(Network network, NetworkCapabilities caps) {
+            cellNetwork = network;
+            // v1.7 gate, same idea as the WiFi callback: only a new
+            // cellular network identity evaluates; capability churn
+            // on the same network does not.
+            String sig = network == null ? "-" : network.toString();
+            if (sig.equals(lastCellSig)) {
+                return;
+            }
+            lastCellSig = sig;
             postEvaluate();
         }
 
@@ -267,6 +314,7 @@ public class SwitchService extends Service {
             if (network != null && network.equals(cellNetwork)) {
                 cellNetwork = null;
             }
+            lastCellSig = null;
             postEvaluate();
         }
     }
@@ -310,13 +358,46 @@ public class SwitchService extends Service {
         return null;
     }
 
+    private static String bssidFromCaps(NetworkCapabilities caps) {
+        if (!capsHaveWifi(caps)) {
+            return null;
+        }
+        if (Build.VERSION.SDK_INT >= 31) {
+            Object ti = caps.getTransportInfo();
+            if (ti instanceof WifiInfo) {
+                return ((WifiInfo) ti).getBSSID();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * v1.7 identity signature of a WiFi capabilities delivery: the
+     * network handle plus the SSID and BSSID in the delivered
+     * WifiInfo, and nothing else. Signal strength, link speed and
+     * the other fast-changing WifiInfo/capability fields are
+     * deliberately excluded, so deliveries that only move those
+     * compare equal and are gated away in WifiCallback. A delivery
+     * whose WifiInfo newly contains a readable SSID (or a different
+     * one) changes the signature, as does roaming to another BSSID.
+     */
+    private static String wifiSignature(Network network, NetworkCapabilities caps) {
+        String ssid = ssidFromCaps(caps);
+        String bssid = bssidFromCaps(caps);
+        return (network == null ? "-" : network.toString())
+                + "|" + (ssid == null ? "" : ssid)
+                + "|" + (bssid == null ? "" : bssid);
+    }
+
     /**
      * The single network-reading path used by every evaluation (service
      * start, network callbacks, UI-triggered re-evaluation). The WiFi
      * tracker's
      * latest WifiInfo is the primary SSID source; one-shot capabilities
      * reads and WifiManager.getConnectionInfo() only supplement it, and
-     * any positively known SSID wins over redacted ones. "On WiFi" comes
+     * any positively known SSID wins over redacted ones. Since 1.7, a
+     * known SSID from the tracker returns immediately, before any of
+     * the supplement reads run. "On WiFi" comes
      * from the tracker, never from the default network (which is the VPN
      * itself while Tailscale is up). The result has ssid == null while
      * onWifi is true when every source came back redacted; callers must
@@ -336,6 +417,14 @@ public class SwitchService extends Service {
             if (s != null) {
                 ni.ssid = s;
                 ni.ssidSource = SRC_WIFI_CALLBACK;
+                // v1.7 short-circuit: the tracker already produced a
+                // known SSID, so the reading is complete. The one-shot
+                // capabilities reads and WifiManager below only exist
+                // to supplement a missing name (and, off WiFi, to find
+                // cellular evidence); with the name in hand they would
+                // add location-attributed reads and change nothing:
+                // onCellular only feeds the off-WiFi branches.
+                return ni;
             }
         }
 

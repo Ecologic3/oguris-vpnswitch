@@ -27,7 +27,7 @@ home networks and on everywhere else.
   `oguris-vpnswitch.keystore` (alias `oguris-vpnswitch`), the same
   per-app keystore convention as the other Oguri apps; future updates
   of this app must keep using it.
-- Package `app.oguri.vpnswitch`, version 1.6 (versionCode 7),
+- Package `app.oguri.vpnswitch`, version 1.7 (versionCode 8),
   minSdk 29, targetSdk 34.
 - v1.4: the foreground-service status notification moved to a new
   IMPORTANCE_MIN channel (`vpnswitch_status_min`; the v1.0-v1.3 channel
@@ -50,3 +50,17 @@ home networks and on everywhere else.
   moment a name is read, the WiFi drops, a switch fires, or the
   service stops. Outside that burst there is still no timer anywhere
   in the service.
+- v1.7: fewer WiFi-name reads, no behavior change. Every WiFi-info
+  read counts as a location access on Android, and the network
+  callbacks used to evaluate on every onCapabilitiesChanged delivery,
+  including pure signal-strength and link-speed churn while the phone
+  sits still on one network. The WiFi and cellular callbacks now
+  distill each delivery into an identity signature (network handle,
+  SSID, BSSID; no signal or speed fields) and only a changed
+  signature evaluates, while onAvailable/onLost still always do, so
+  a delivery that newly carries a readable SSID is never missed.
+  readNet() also short-circuits: when the tracker's delivered
+  WifiInfo already yields a known SSID it returns without the
+  one-shot capabilities read and without the WifiManager read. The
+  1.6 burst, the hold semantics and the transition-only broadcasts
+  are untouched; the trim only removes stationary flicker reads.
